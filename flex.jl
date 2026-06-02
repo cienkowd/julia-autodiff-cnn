@@ -364,7 +364,8 @@ function (c::Conv2DOp)(x::GraphNode)
     true)
   H, Wd, _ = size(x.data)
   out = zeros(Float32, H, Wd, c.C_out)
-  GraphNode(:conv, (x, W), out, (; pad=c.pad))
+  # col/Wmat: cache wynikow forward, wykorzystywany w backward (bez ponownego im2col)
+  GraphNode(:conv, (x, W), out, (; pad=c.pad, col=Ref{Any}(nothing), Wmat=Ref{Any}(nothing)))
 end
 
 function primal!(y::GraphNode{:conv,2})
@@ -381,6 +382,11 @@ function primal!(y::GraphNode{:conv,2})
   out = W_mat * col
 
   y.data .= permutedims(reshape(out, C_out, H, Wd), (2, 3, 1))
+
+  # zapamietaj na potrzeby backward (wagi i wejscie nie zmieniaja sie miedzy
+  # forward a backward tej samej probki -> col i W_mat sa wciaz poprawne)
+  y.meta.col[] = col
+  y.meta.Wmat[] = W_mat
   return nothing
 end
 
@@ -390,9 +396,9 @@ function adjoint!(y::GraphNode{:conv,2})
   H, Wd, C_in = size(x.data)
   kH, kW, _, C_out = size(W.data)
 
-  xp = pad2d(x.data, p)
-  col = im2col(xp, H, Wd, kH, kW, C_in)
-  W_mat = reshape(permutedims(W.data, (4, 1, 2, 3)), C_out, kH * kW * C_in)
+  # uzyj wartosci policzonych w forward zamiast liczyc pad2d/im2col/permutedims drugi raz
+  col = y.meta.col[]::Matrix{Float32}
+  W_mat = y.meta.Wmat[]::Matrix{Float32}
 
   g_mat = reshape(permutedims(y.grad, (3, 1, 2)), C_out, H * Wd)
 
