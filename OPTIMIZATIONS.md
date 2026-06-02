@@ -16,7 +16,9 @@ Wszystkie liczby zmierzone na **tej samej maszynie, seed=1, 3 epoki** (`--mode f
 |----|----------------------|-----------|-----|---------------:|---------------:|-------------:|-----------|
 | 0  | baseline KM1         | —         | —   | 94.93          | 341.1          | 87.44        | OK        |
 | 1  | cache im2col w Conv  | pamięć    | #1  | 94.37          | 325.7          | 87.44        | OK        |
-|    | **Δ względem baseline** |        |     | **−0.6%**      | **−15.4 GiB (−4.5%)** | =     | OK        |
+| 2  | operacje in-place    | pamięć    | #2  | 95.41          | 215.8          | 87.44        | OK        |
+|    | **Δ #2 względem #1** |          |     | +1.1% (szum)   | **−109.9 GiB (−33.7%)** | =   | OK        |
+|    | **Δ łącznie vs KM1** |          |     | ≈0             | **−125.3 GiB (−36.7%)** | =   | OK        |
 
 Dla porównania, baseline z notebooka KM1 (inna maszyna): 163.8 s/epokę, 330.6 GiB, 86.37% —
 poglądowy, niemiarodajny do porównań czasu.
@@ -54,6 +56,31 @@ gradientów, im2col liczone dwukrotnie (forward i backward), nietypowane pola `G
   obu stronach, bo i tak alokowaliśmy te tablice dwukrotnie). Ważna lekcja metodologiczna:
   porównanie z notebookiem (inna maszyna) sugerowało −42% czasu — pomiar na tej samej maszynie
   pokazał, że to artefakt sprzętu, a realny zysk jest w pamięci.
+
+### 2. Operacje in-place (eliminacja tymczasowych alokacji)
+- **Kategoria:** gospodarka pamięcią
+- **PR:** #2
+- **Problem:** `primal!`/`adjoint!` w gorącej ścieżce sieci alokowały tablice na każdy
+  przykład: `=`/`+=` rebindowały pola (`y.data = W*x`, `grad += ...`), a `maxpool` i `dropout`
+  kopiowały wycinki/maski. Przy ~60k przykładów × 3 epoki to główne źródło ~325 GiB.
+- **Zmiana (bez zmiany matematyki):**
+  - `:mul` — `mul!(y.data, W, x)`; `W.grad .+= y.grad .* x'` (broadcast); `mul!(x.grad, W', y.grad, true, true)`
+  - `:add`, `:flatten`, `:logit_ce`, conv-grad — `=`/`+=` → `.=`/`.+=` (akumulacja in-place)
+  - `:logit_ce` primal — `sum(v->exp(v-m), ...)` zamiast tymczasowej tablicy `exp.(...)`
+  - `:maxpool` — `@view` zamiast kopiowania patcha (forward i backward)
+  - `:dropout` — prealokowany bufor maski + `rand!` (zamiast `rand(...)` co forward)
+- **Wynik (ta sama maszyna, seed=1, 3 epoki):**
+  - czas/epokę: 94.37 → 95.41 s (+1.1%, w granicach szumu)
+  - alokacje: 325.7 → 215.8 GiB (**−109.9 GiB, −33.7%**); GC 4.82% → 3.28%
+  - test acc: 87.44% (identyczne, gradcheck OK)
+- **Weryfikacja:** `--gradcheck-only` → **OK** (2.9e-3); acc/loss identyczne co do 4 miejsc.
+- **Wniosek (ważny do artykułu):** presja pamięci spadła o 1/3, ale **wall-clock bez zmian** —
+  czas jest zdominowany przez obliczenia (pętle im2col + małe mnożenia BLAS na pojedynczych
+  obrazach), nie przez GC (które i tak było tylko ~5%). Wniosek: dalsze przyspieszenie wymaga
+  ataku na *obliczenia* (batching, redukcja narzutu dispatchu, lepszy im2col), nie na alokacje.
+- **Do artykułu:** klasyczna gospodarka pamięcią w Julii (W06) — `mul!`/`@.`/`@view`/`rand!`
+  zamiast alokujących operatorów. Dobra ilustracja, że redukcja alokacji ≠ redukcja czasu,
+  gdy obciążenie nie jest GC-bound.
 
 <!-- ───────────────────────────────────────────────────────────────────────
 Szablon wpisu — KOPIUJ dla każdej optymalizacji i dopisz wiersz do tabeli wyżej:
