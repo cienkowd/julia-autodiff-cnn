@@ -1,0 +1,2 @@
+timestamp,commit,label,mode,epochs,seed,time_s,time_per_epoch_s,alloc_gib,gc_frac,test_acc,test_loss
+2026-04-23T00:00:00,e406b58,km1-baseline (notebook),full,3,NA,491.37,163.79,330.6,7.46,86.37,0.3791
