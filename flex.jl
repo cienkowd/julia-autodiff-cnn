@@ -103,25 +103,25 @@ end
 
 function primal!(y::GraphNode{:mul,2})
   W, x = y.args
-  y.data = W.data * x.data
+  mul!(y.data, W.data, x.data)            # zamiast y.data = W.data * x.data (alokacja)
   return nothing
 end
 function adjoint!(y::GraphNode{:mul,2})
   W, x = y.args
-  W.grad += y.grad * x.data'
-  x.grad += W.data' * y.grad
+  W.grad .+= y.grad .* x.data'            # outer product, broadcast bez tymczasowych
+  mul!(x.grad, W.data', y.grad, true, true)  # x.grad += W.data' * y.grad (in-place)
   return nothing
 end
 
 function primal!(z::GraphNode{:add,2})
   x, y = z.args
-  z.data = x.data .+ y.data
+  z.data .= x.data .+ y.data
   return nothing
 end
 function adjoint!(z::GraphNode{:add,2})
   x, y = z.args
-  x.grad += z.grad
-  y.grad += z.grad
+  x.grad .+= z.grad
+  y.grad .+= z.grad
   return nothing
 end
 
@@ -265,7 +265,7 @@ end
 
 function adjoint!(y::GraphNode{:flatten,1})
   x, = y.args
-  x.grad += reshape(y.grad, size(x.data))
+  x.grad .+= reshape(y.grad, size(x.data))   # reshape to widok, .+= bez alokacji
   return nothing
 end
 
@@ -301,13 +301,16 @@ end
 function primal!(z::GraphNode{:logit_ce,2})
   yhat, y = z.args
   m = maximum(yhat.data)
-  z.data[1] = log(sum(exp.(yhat.data .- m))) + m - dot(yhat.data, y.data)
+  s = sum(v -> exp(v - m), yhat.data)      # bez tymczasowej tablicy exp.(...)
+  z.data[1] = log(s) + m - dot(yhat.data, y.data)
   return nothing
 end
 
 function adjoint!(z::GraphNode{:logit_ce,2})
   yhat, y = z.args
-  yhat.grad += (_softmax(yhat.data) .- y.data) .* z.grad[1]
+  s = _softmax(yhat.data)
+  g = z.grad[1]
+  @. yhat.grad += (s - y.data) * g         # akumulacja in-place
   return nothing
 end
 
@@ -403,10 +406,10 @@ function adjoint!(y::GraphNode{:conv,2})
   g_mat = reshape(permutedims(y.grad, (3, 1, 2)), C_out, H * Wd)
 
   dW_mat = g_mat * col'
-  W.grad += permutedims(reshape(dW_mat, C_out, kH, kW, C_in), (2, 3, 4, 1))
+  W.grad .+= permutedims(reshape(dW_mat, C_out, kH, kW, C_in), (2, 3, 4, 1))
 
   dx_col = W_mat' * g_mat
-  x.grad += col2im(dx_col, H, Wd, C_in, kH, kW, p)
+  x.grad .+= col2im(dx_col, H, Wd, C_in, kH, kW, p)
   return nothing
 end
 
@@ -428,7 +431,7 @@ function primal!(y::GraphNode{:maxpool,1})
   for c in 1:C, oi in 1:Ho, oj in 1:Wo
     ri = (oi-1)*pool+1:oi*pool
     rj = (oj-1)*pool+1:oj*pool
-    @inbounds y.data[oi, oj, c] = maximum(x.data[ri, rj, c])
+    @inbounds y.data[oi, oj, c] = maximum(@view x.data[ri, rj, c])  # widok, bez alokacji patcha
   end
   return nothing
 end
@@ -441,7 +444,7 @@ function adjoint!(y::GraphNode{:maxpool,1})
   for c in 1:C, oi in 1:Ho, oj in 1:Wo
     ri = (oi-1)*pool+1:oi*pool
     rj = (oj-1)*pool+1:oj*pool
-    patch = x.data[ri, rj, c]
+    patch = @view x.data[ri, rj, c]        # widok zamiast kopii patcha
     ki, kj = Tuple(argmax(patch))
     @inbounds x.grad[(oi-1)*pool+ki, (oj-1)*pool+kj, c] += y.grad[oi, oj, c]
   end
@@ -464,9 +467,14 @@ function primal!(y::GraphNode{:dropout,1})
   if !m.training[]
     y.data .= x.data
   else
-    mask = Float32.(rand(Float32, size(x.data)) .> m.rate) ./ (1f0 - m.rate)
-    m.mask[] = mask
-    y.data .= x.data .* mask
+    mask = m.mask[]
+    if mask === nothing                    # bufor alokowany raz, potem reuse
+      mask = similar(x.data)
+      m.mask[] = mask
+    end
+    rand!(mask)
+    @. mask = (mask > m.rate) / (1f0 - m.rate)
+    @. y.data = x.data * mask
   end
   return nothing
 end
@@ -475,9 +483,9 @@ function adjoint!(y::GraphNode{:dropout,1})
   x, = y.args
   m = y.meta
   if !m.training[]
-    x.grad += y.grad
+    x.grad .+= y.grad
   else
-    x.grad += y.grad .* m.mask[]
+    x.grad .+= y.grad .* m.mask[]
   end
   return nothing
 end

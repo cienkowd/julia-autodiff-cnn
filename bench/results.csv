@@ -2,3 +2,4 @@ timestamp,commit,label,mode,epochs,seed,time_s,time_per_epoch_s,alloc_gib,gc_fra
 2026-04-23T00:00:00,e406b58,km1-baseline (notebook),full,3,NA,491.37,163.79,330.6,7.46,86.37,0.3791
 2026-06-02T20:48:27.024,0fe1df1,conv-im2col-cache,full,3,1,283.11,94.37,325.705,4.82,87.44,0.3464
 2026-06-02T20:57:40.436,0fe1df1,baseline,full,3,1,284.8,94.93,341.141,4.75,87.44,0.3464
+2026-06-02T21:21:10.749,c828c00,inplace-ops,full,3,1,286.22,95.41,215.847,3.28,87.44,0.3464
