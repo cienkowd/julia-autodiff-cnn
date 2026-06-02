@@ -1,1 +1,8 @@
 materiały/
+materialy/
+.DS_Store
+
+# PyTorch reference
+reference/pytorch/data/
+__pycache__/
+*.pyc
