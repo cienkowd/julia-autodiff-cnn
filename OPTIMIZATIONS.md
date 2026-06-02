@@ -18,7 +18,11 @@ Wszystkie liczby zmierzone na **tej samej maszynie, seed=1, 3 epoki** (`--mode f
 | 1  | cache im2col w Conv  | pamięć    | #1  | 94.37          | 325.7          | 87.44        | OK        |
 | 2  | operacje in-place    | pamięć    | #2  | 95.41          | 215.8          | 87.44        | OK        |
 |    | **Δ #2 względem #1** |          |     | +1.1% (szum)   | **−109.9 GiB (−33.7%)** | =   | OK        |
-|    | **Δ łącznie vs KM1** |          |     | ≈0             | **−125.3 GiB (−36.7%)** | =   | OK        |
+| 3  | stabilność typów (bariery) | kod | #3 | **13.9**    | **52.2**       | 87.44        | OK          |
+|    | **Δ #3 względem #2** |          |     | **−85.4% (6.9×)** | **−163.7 GiB (−75.8%)** | = | OK   |
+|    | **Δ łącznie vs KM1** |          |     | **−85.4% (6.8×)** | **−288.9 GiB (−84.7%)** | = | OK   |
+
+Łącznie: 3 epoki **284.8 s → 41.7 s** (0.7 min), alokacje **341 GiB → 52 GiB**, acc bez zmian (87.44%).
 
 Dla porównania, baseline z notebooka KM1 (inna maszyna): 163.8 s/epokę, 330.6 GiB, 86.37% —
 poglądowy, niemiarodajny do porównań czasu.
@@ -81,6 +85,31 @@ gradientów, im2col liczone dwukrotnie (forward i backward), nietypowane pola `G
 - **Do artykułu:** klasyczna gospodarka pamięcią w Julii (W06) — `mul!`/`@.`/`@view`/`rand!`
   zamiast alokujących operatorów. Dobra ilustracja, że redukcja alokacji ≠ redukcja czasu,
   gdy obciążenie nie jest GC-bound.
+
+### 3. Stabilność typów — bariery funkcyjne na gorących kernelach
+- **Kategoria:** efektywność wygenerowanego kodu
+- **PR:** #3
+- **Problem:** pola `GraphNode` (`data`, `grad`, `args`) są nietypowane (`::Any`). Operacje
+  liczone *w miejscu* w ciele `primal!`/`adjoint!` (pętle MaxPool, ReLU, softmax w logit-CE)
+  działały więc na boxowanych tablicach — bez specjalizacji i SIMD. Conv/mul były już OK,
+  bo przechodzą przez typowane funkcje (`im2col`, `mul!`), które same działają jak bariery.
+- **Zmiana:** wyciągnięcie kerneli do osobnych funkcji (`_maxpool_fwd!/_back!`, `_relu_*`,
+  `_logit_ce*`). Jeden dynamiczny dispatch przy wejściu, po którym wnętrze kompiluje się pod
+  konkretne typy tablic. Bez zmiany struktury `GraphNode` (niskie ryzyko) i bez zmiany matematyki.
+  Przy okazji softmax w logit-CE liczony in-line (bez bufora `_softmax`).
+- **Wynik (ta sama maszyna, seed=1, 3 epoki):**
+  - czas/epokę: 95.41 → **13.9 s** (**−85.4%, 6.9× szybciej**)
+  - alokacje: 215.8 → **52.2 GiB** (**−163.7 GiB, −75.8%**); GC 3.28% → 2.19%
+  - test acc: 87.44% (identyczne, gradcheck OK)
+- **Weryfikacja:** `--gradcheck-only` → **OK** (2.9e-3); acc/loss identyczne co do 4 miejsc.
+- **Wniosek (kluczowy do artykułu):** to była **dominująca** optymalizacja, nie kosmetyka.
+  Nietypowane pola `GraphNode` (`::Any`) powodowały, że pętle MaxPool na boxowanych tablicach
+  alokowały i działały dynamicznie *per element* — to pochłaniało ~85% czasu i ~75% alokacji.
+  Co istotne: PR #2 (in-place) NIE pomógł MaxPoolowi, bo `@view` na tablicy `::Any` i tak boxuje;
+  dopiero bariera funkcyjna przywróciła specjalizację. Pokazuje, że redukcja alokacji bez
+  stabilności typów ma ograniczony zasięg.
+- **Do artykułu:** wzorzec *function barrier* (W05/W06) — jak odzyskać specjalizację kodu, gdy
+  graf przechowuje węzły jako `::Any`, bez przebudowy struktury węzła.
 
 <!-- ───────────────────────────────────────────────────────────────────────
 Szablon wpisu — KOPIUJ dla każdej optymalizacji i dopisz wiersz do tabeli wyżej:
