@@ -125,18 +125,29 @@ function adjoint!(z::GraphNode{:add,2})
   return nothing
 end
 
+# Bariery funkcyjne: pola GraphNode sa ::Any (niestabilne typowo). Przekazanie ich do
+# osobnej funkcji-kernela powoduje jeden dynamiczny dispatch, po ktorym wnetrze kompiluje
+# sie pod konkretne typy tablic (szybkie petle SIMD zamiast boxowanych operacji).
+@inline function _relu_fwd!(yd, xd)
+  yd .= max.(0f0, xd)
+  return nothing
+end
+@inline function _relu_back!(xg, xd, yd, yg)
+  @inbounds for i in eachindex(xd, yd)
+    if xd[i] == yd[i]
+      xg[i] += yg[i]
+    end
+  end
+  return nothing
+end
 function primal!(y::GraphNode{:relu,1})
   x, = y.args
-  y.data .= max.(0, x.data)
+  _relu_fwd!(y.data, x.data)
   return nothing
 end
 function adjoint!(y::GraphNode{:relu,1})
   x, = y.args
-  for i in 1:length(x.data)
-    if x.data[i] == y.data[i]
-      x.grad[i] += y.grad[i]
-    end
-  end
+  _relu_back!(x.grad, x.data, y.data, y.grad)
   return nothing
 end
 
@@ -298,19 +309,29 @@ function (::LogitCEOp)(yhat::GraphNode, y::GraphNode)
   GraphNode(:logit_ce, (yhat, y), zeros(Float32, 1))
 end
 
-function primal!(z::GraphNode{:logit_ce,2})
-  yhat, y = z.args
-  m = maximum(yhat.data)
-  s = sum(v -> exp(v - m), yhat.data)      # bez tymczasowej tablicy exp.(...)
-  z.data[1] = log(s) + m - dot(yhat.data, y.data)
+# Bariery: yhat.data/yhat.grad sa ::Any. Wewnatrz kerneli typy sa konkretne,
+# softmax liczony in-line (bez alokacji bufora) i typowo-stabilnie.
+function _logit_ce(yh, y)
+  m = maximum(yh)
+  s = sum(v -> exp(v - m), yh)
+  return log(s) + m - dot(yh, y)
+end
+function _logit_ce_back!(yg, yh, y, g)
+  m = maximum(yh)
+  s = sum(v -> exp(v - m), yh)
+  @inbounds @simd for i in eachindex(yg)
+    yg[i] += (exp(yh[i] - m) / s - y[i]) * g
+  end
   return nothing
 end
-
+function primal!(z::GraphNode{:logit_ce,2})
+  yhat, y = z.args
+  z.data[1] = _logit_ce(yhat.data, y.data)
+  return nothing
+end
 function adjoint!(z::GraphNode{:logit_ce,2})
   yhat, y = z.args
-  s = _softmax(yhat.data)
-  g = z.grad[1]
-  @. yhat.grad += (s - y.data) * g         # akumulacja in-place
+  _logit_ce_back!(yhat.grad, yhat.data, y.data, z.grad[1])
   return nothing
 end
 
@@ -423,31 +444,37 @@ function (p::MaxPool2DOp)(x::GraphNode)
   GraphNode(:maxpool, (x,), zeros(Float32, Ho, Wo, C), (; pool=p.pool))
 end
 
-function primal!(y::GraphNode{:maxpool,1})
-  x, = y.args
-  pool = y.meta.pool
-  H, W, C = size(x.data)
+# Kernel typowo-stabilny (bariera): petle po tablicy rozmiaru splotu — najwiekszy zysk z #3.
+function _maxpool_fwd!(yd, xd, pool)
+  H, W, C = size(xd)
   Ho, Wo = H ÷ pool, W ÷ pool
-  for c in 1:C, oi in 1:Ho, oj in 1:Wo
+  @inbounds for c in 1:C, oi in 1:Ho, oj in 1:Wo
     ri = (oi-1)*pool+1:oi*pool
     rj = (oj-1)*pool+1:oj*pool
-    @inbounds y.data[oi, oj, c] = maximum(@view x.data[ri, rj, c])  # widok, bez alokacji patcha
+    yd[oi, oj, c] = maximum(@view xd[ri, rj, c])
   end
   return nothing
 end
-
-function adjoint!(y::GraphNode{:maxpool,1})
-  x, = y.args
-  pool = y.meta.pool
-  H, W, C = size(x.data)
+function _maxpool_back!(xg, xd, yg, pool)
+  H, W, C = size(xd)
   Ho, Wo = H ÷ pool, W ÷ pool
-  for c in 1:C, oi in 1:Ho, oj in 1:Wo
+  @inbounds for c in 1:C, oi in 1:Ho, oj in 1:Wo
     ri = (oi-1)*pool+1:oi*pool
     rj = (oj-1)*pool+1:oj*pool
-    patch = @view x.data[ri, rj, c]        # widok zamiast kopii patcha
+    patch = @view xd[ri, rj, c]
     ki, kj = Tuple(argmax(patch))
-    @inbounds x.grad[(oi-1)*pool+ki, (oj-1)*pool+kj, c] += y.grad[oi, oj, c]
+    xg[(oi-1)*pool+ki, (oj-1)*pool+kj, c] += yg[oi, oj, c]
   end
+  return nothing
+end
+function primal!(y::GraphNode{:maxpool,1})
+  x, = y.args
+  _maxpool_fwd!(y.data, x.data, y.meta.pool)
+  return nothing
+end
+function adjoint!(y::GraphNode{:maxpool,1})
+  x, = y.args
+  _maxpool_back!(x.grad, x.data, y.grad, y.meta.pool)
   return nothing
 end
 
