@@ -5,9 +5,16 @@ co w bibliotece Julia, służy do porównania (czas, dokładność).
 
 ## Uruchomienie
 
+macOS (Python z CommandLineTools nie ma `pip` na PATH — używaj `python3 -m pip`; najlepiej w venv):
+
 ```bash
-pip install -r requirements.txt
-python train.py            # 3 epoki, batch=10, lr=1e-2, CPU
+cd reference/pytorch
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements.txt
+python3 train.py            # 3 epoki, batch=10, lr=1e-2, CPU; dopisze wiersz do ../results.csv
+deactivate
 ```
 
 ## Założenia porównania
