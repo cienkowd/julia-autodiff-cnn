@@ -79,14 +79,14 @@ function main()
     @printf("  test_acc          %.2f\n", te.acc)
     @printf("  test_loss         %.4f\n", te.loss)
 
-    # dopisz do wspolnego results.csv (ta sama tabela co flex)
-    results = normpath(joinpath(@__DIR__, "..", "..", "bench", "results.csv"))
+    # dopisz do reference/results.csv (tabela porownawcza przy rozwiazaniach referencyjnych)
+    # schema: solution,framework,time_per_epoch_s,total_time_s,alloc_gib,test_acc,test_loss
+    results = normpath(joinpath(@__DIR__, "..", "results.csv"))
     open(results, "a") do io
-        println(io, join((string(now()), "flux", "flux-reference", "full",
-                settings.epochs, settings.seed,
-                round(stats.time; digits=2), round(stats.time / settings.epochs; digits=2),
+        println(io, join(("flux-reference", "Julia / Flux.jl",
+                round(stats.time / settings.epochs; digits=2),
+                round(stats.time; digits=2),
                 round(stats.bytes / 2^30; digits=3),
-                round(100 * stats.gctime / stats.time; digits=2),
                 te.acc, round(te.loss; digits=4)), ","))
     end
     println("\nzapisano wiersz 'flux-reference' do $results")
