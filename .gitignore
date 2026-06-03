@@ -6,3 +6,4 @@ materialy/
 reference/pytorch/data/
 __pycache__/
 *.pyc
+.venv/
