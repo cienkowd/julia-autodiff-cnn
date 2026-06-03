@@ -103,40 +103,51 @@ end
 
 function primal!(y::GraphNode{:mul,2})
   W, x = y.args
-  y.data = W.data * x.data
+  mul!(y.data, W.data, x.data)            # zamiast y.data = W.data * x.data (alokacja)
   return nothing
 end
 function adjoint!(y::GraphNode{:mul,2})
   W, x = y.args
-  W.grad += y.grad * x.data'
-  x.grad += W.data' * y.grad
+  W.grad .+= y.grad .* x.data'            # outer product, broadcast bez tymczasowych
+  mul!(x.grad, W.data', y.grad, true, true)  # x.grad += W.data' * y.grad (in-place)
   return nothing
 end
 
 function primal!(z::GraphNode{:add,2})
   x, y = z.args
-  z.data = x.data .+ y.data
+  z.data .= x.data .+ y.data
   return nothing
 end
 function adjoint!(z::GraphNode{:add,2})
   x, y = z.args
-  x.grad += z.grad
-  y.grad += z.grad
+  x.grad .+= z.grad
+  y.grad .+= z.grad
   return nothing
 end
 
+# Bariery funkcyjne: pola GraphNode sa ::Any (niestabilne typowo). Przekazanie ich do
+# osobnej funkcji-kernela powoduje jeden dynamiczny dispatch, po ktorym wnetrze kompiluje
+# sie pod konkretne typy tablic (szybkie petle SIMD zamiast boxowanych operacji).
+@inline function _relu_fwd!(yd, xd)
+  yd .= max.(0f0, xd)
+  return nothing
+end
+@inline function _relu_back!(xg, xd, yd, yg)
+  @inbounds for i in eachindex(xd, yd)
+    if xd[i] == yd[i]
+      xg[i] += yg[i]
+    end
+  end
+  return nothing
+end
 function primal!(y::GraphNode{:relu,1})
   x, = y.args
-  y.data .= max.(0, x.data)
+  _relu_fwd!(y.data, x.data)
   return nothing
 end
 function adjoint!(y::GraphNode{:relu,1})
   x, = y.args
-  for i in 1:length(x.data)
-    if x.data[i] == y.data[i]
-      x.grad[i] += y.grad[i]
-    end
-  end
+  _relu_back!(x.grad, x.data, y.data, y.grad)
   return nothing
 end
 
@@ -265,7 +276,7 @@ end
 
 function adjoint!(y::GraphNode{:flatten,1})
   x, = y.args
-  x.grad += reshape(y.grad, size(x.data))
+  x.grad .+= reshape(y.grad, size(x.data))   # reshape to widok, .+= bez alokacji
   return nothing
 end
 
@@ -298,16 +309,29 @@ function (::LogitCEOp)(yhat::GraphNode, y::GraphNode)
   GraphNode(:logit_ce, (yhat, y), zeros(Float32, 1))
 end
 
-function primal!(z::GraphNode{:logit_ce,2})
-  yhat, y = z.args
-  m = maximum(yhat.data)
-  z.data[1] = log(sum(exp.(yhat.data .- m))) + m - dot(yhat.data, y.data)
+# Bariery: yhat.data/yhat.grad sa ::Any. Wewnatrz kerneli typy sa konkretne,
+# softmax liczony in-line (bez alokacji bufora) i typowo-stabilnie.
+function _logit_ce(yh, y)
+  m = maximum(yh)
+  s = sum(v -> exp(v - m), yh)
+  return log(s) + m - dot(yh, y)
+end
+function _logit_ce_back!(yg, yh, y, g)
+  m = maximum(yh)
+  s = sum(v -> exp(v - m), yh)
+  @inbounds @simd for i in eachindex(yg)
+    yg[i] += (exp(yh[i] - m) / s - y[i]) * g
+  end
   return nothing
 end
-
+function primal!(z::GraphNode{:logit_ce,2})
+  yhat, y = z.args
+  z.data[1] = _logit_ce(yhat.data, y.data)
+  return nothing
+end
 function adjoint!(z::GraphNode{:logit_ce,2})
   yhat, y = z.args
-  yhat.grad += (_softmax(yhat.data) .- y.data) .* z.grad[1]
+  _logit_ce_back!(yhat.grad, yhat.data, y.data, z.grad[1])
   return nothing
 end
 
@@ -364,7 +388,8 @@ function (c::Conv2DOp)(x::GraphNode)
     true)
   H, Wd, _ = size(x.data)
   out = zeros(Float32, H, Wd, c.C_out)
-  GraphNode(:conv, (x, W), out, (; pad=c.pad))
+  # col/Wmat: cache wynikow forward, wykorzystywany w backward (bez ponownego im2col)
+  GraphNode(:conv, (x, W), out, (; pad=c.pad, col=Ref{Any}(nothing), Wmat=Ref{Any}(nothing)))
 end
 
 function primal!(y::GraphNode{:conv,2})
@@ -381,6 +406,11 @@ function primal!(y::GraphNode{:conv,2})
   out = W_mat * col
 
   y.data .= permutedims(reshape(out, C_out, H, Wd), (2, 3, 1))
+
+  # zapamietaj na potrzeby backward (wagi i wejscie nie zmieniaja sie miedzy
+  # forward a backward tej samej probki -> col i W_mat sa wciaz poprawne)
+  y.meta.col[] = col
+  y.meta.Wmat[] = W_mat
   return nothing
 end
 
@@ -390,17 +420,17 @@ function adjoint!(y::GraphNode{:conv,2})
   H, Wd, C_in = size(x.data)
   kH, kW, _, C_out = size(W.data)
 
-  xp = pad2d(x.data, p)
-  col = im2col(xp, H, Wd, kH, kW, C_in)
-  W_mat = reshape(permutedims(W.data, (4, 1, 2, 3)), C_out, kH * kW * C_in)
+  # uzyj wartosci policzonych w forward zamiast liczyc pad2d/im2col/permutedims drugi raz
+  col = y.meta.col[]::Matrix{Float32}
+  W_mat = y.meta.Wmat[]::Matrix{Float32}
 
   g_mat = reshape(permutedims(y.grad, (3, 1, 2)), C_out, H * Wd)
 
   dW_mat = g_mat * col'
-  W.grad += permutedims(reshape(dW_mat, C_out, kH, kW, C_in), (2, 3, 4, 1))
+  W.grad .+= permutedims(reshape(dW_mat, C_out, kH, kW, C_in), (2, 3, 4, 1))
 
   dx_col = W_mat' * g_mat
-  x.grad += col2im(dx_col, H, Wd, C_in, kH, kW, p)
+  x.grad .+= col2im(dx_col, H, Wd, C_in, kH, kW, p)
   return nothing
 end
 
@@ -414,31 +444,37 @@ function (p::MaxPool2DOp)(x::GraphNode)
   GraphNode(:maxpool, (x,), zeros(Float32, Ho, Wo, C), (; pool=p.pool))
 end
 
-function primal!(y::GraphNode{:maxpool,1})
-  x, = y.args
-  pool = y.meta.pool
-  H, W, C = size(x.data)
+# Kernel typowo-stabilny (bariera): petle po tablicy rozmiaru splotu — najwiekszy zysk z #3.
+function _maxpool_fwd!(yd, xd, pool)
+  H, W, C = size(xd)
   Ho, Wo = H ÷ pool, W ÷ pool
-  for c in 1:C, oi in 1:Ho, oj in 1:Wo
+  @inbounds for c in 1:C, oi in 1:Ho, oj in 1:Wo
     ri = (oi-1)*pool+1:oi*pool
     rj = (oj-1)*pool+1:oj*pool
-    @inbounds y.data[oi, oj, c] = maximum(x.data[ri, rj, c])
+    yd[oi, oj, c] = maximum(@view xd[ri, rj, c])
   end
   return nothing
 end
-
-function adjoint!(y::GraphNode{:maxpool,1})
-  x, = y.args
-  pool = y.meta.pool
-  H, W, C = size(x.data)
+function _maxpool_back!(xg, xd, yg, pool)
+  H, W, C = size(xd)
   Ho, Wo = H ÷ pool, W ÷ pool
-  for c in 1:C, oi in 1:Ho, oj in 1:Wo
+  @inbounds for c in 1:C, oi in 1:Ho, oj in 1:Wo
     ri = (oi-1)*pool+1:oi*pool
     rj = (oj-1)*pool+1:oj*pool
-    patch = x.data[ri, rj, c]
+    patch = @view xd[ri, rj, c]
     ki, kj = Tuple(argmax(patch))
-    @inbounds x.grad[(oi-1)*pool+ki, (oj-1)*pool+kj, c] += y.grad[oi, oj, c]
+    xg[(oi-1)*pool+ki, (oj-1)*pool+kj, c] += yg[oi, oj, c]
   end
+  return nothing
+end
+function primal!(y::GraphNode{:maxpool,1})
+  x, = y.args
+  _maxpool_fwd!(y.data, x.data, y.meta.pool)
+  return nothing
+end
+function adjoint!(y::GraphNode{:maxpool,1})
+  x, = y.args
+  _maxpool_back!(x.grad, x.data, y.grad, y.meta.pool)
   return nothing
 end
 
@@ -458,9 +494,14 @@ function primal!(y::GraphNode{:dropout,1})
   if !m.training[]
     y.data .= x.data
   else
-    mask = Float32.(rand(Float32, size(x.data)) .> m.rate) ./ (1f0 - m.rate)
-    m.mask[] = mask
-    y.data .= x.data .* mask
+    mask = m.mask[]
+    if mask === nothing                    # bufor alokowany raz, potem reuse
+      mask = similar(x.data)
+      m.mask[] = mask
+    end
+    rand!(mask)
+    @. mask = (mask > m.rate) / (1f0 - m.rate)
+    @. y.data = x.data * mask
   end
   return nothing
 end
@@ -469,9 +510,9 @@ function adjoint!(y::GraphNode{:dropout,1})
   x, = y.args
   m = y.meta
   if !m.training[]
-    x.grad += y.grad
+    x.grad .+= y.grad
   else
-    x.grad += y.grad .* m.mask[]
+    x.grad .+= y.grad .* m.mask[]
   end
   return nothing
 end
