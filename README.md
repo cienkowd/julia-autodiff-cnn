@@ -1,6 +1,6 @@
 # Julia Autodiff CNN
 
-> Reverse-mode automatic differentiation and a small CNN (conv, max-pool, dropout, dense) built from scratch in Julia, trained on Fashion-MNIST.
+> Reverse-mode autodiff and a CNN built from scratch, 86% test accuracy on Fashion-MNIST.
 
 ## What is inside
 
